@@ -183,7 +183,7 @@ Mã lỗi: `UNAUTHENTICATED`, `PERMISSION_DENIED`, `RATE_LIMITED`, `VALIDATION_E
 ```bash
 npm run dev        # tsx src/index.ts
 npm run typecheck
-npm test           # vitest: auth, scope gating, wallet lifecycle, ledger SQLite, webhook, http auth/https guard
+npm test           # vitest, 188 test: config, auth/key store, rate-limit (memory+redis fake), audit, ledger provider + store contract, HttpBankProvider (fetch fake), webhook, MCP server, HTTP transport, stdio, keys CLI
 ```
 
 Cấu trúc:

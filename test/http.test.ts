@@ -61,7 +61,7 @@ describe('http transport auth', () => {
   it('health is public', async () => {
     const r = await fetch(`${base}/health`);
     expect(r.status).toBe(200);
-    expect((await r.json()).provider).toBe('mock');
+    expect((((await r.json()) as any)).provider).toBe('mock');
   });
 
   it('401 without key, 401 with bad key', async () => {
@@ -86,7 +86,7 @@ describe('http transport auth', () => {
       body: JSON.stringify(list),
     });
     expect(ok.status).toBe(200);
-    const body = await ok.json();
+    const body = ((await ok.json()) as any);
     expect(body.result.tools.map((t: any) => t.name)).toContain('bank_get_balance');
     expect(body.result.tools.map((t: any) => t.name)).not.toContain('bank_transfer');
 
@@ -149,13 +149,13 @@ describe('incoming payment webhook + https guard', () => {
 
       const ok = await fetch(url, { method: 'POST', headers: { 'content-type': 'application/json', 'x-bank-timestamp': ts, 'x-bank-signature': sign('whsec_test', ts, body) }, body });
       expect(ok.status).toBe(200);
-      const j = await ok.json();
+      const j = ((await ok.json()) as any);
       expect(j.applied).toBe(true);
       expect(j.duplicate).toBe(false);
       expect((await bank.getBalance(w.id)).balance).toBe(120_000);
 
       const again = await fetch(url, { method: 'POST', headers: { 'content-type': 'application/json', 'x-bank-timestamp': ts, 'x-bank-signature': sign('whsec_test', ts, body) }, body });
-      expect((await again.json()).duplicate).toBe(true);
+      expect((((await again.json()) as any)).duplicate).toBe(true);
       expect((await bank.getBalance(w.id)).balance).toBe(120_000);
 
       await new Promise((r) => setTimeout(r, 50));
