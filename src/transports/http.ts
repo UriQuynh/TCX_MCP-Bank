@@ -46,6 +46,14 @@ export function createHttpApp(cfg: AppConfig, deps: HttpDeps) {
 
   app.disable('x-powered-by');
   app.set('trust proxy', 1);
+
+  // Đăng ký TRƯỚC hostHeaderValidation: /health cố tình public, không lộ dữ liệu
+  // (dùng cho Docker HEALTHCHECK/monitoring gọi thẳng qua 127.0.0.1, Host header
+  // không khớp MCP_ALLOWED_HOSTS — nếu đặt sau middleware này sẽ luôn bị 403).
+  app.get('/health', (_req, res) => {
+    res.json({ status: 'ok', name: APP_NAME, version: APP_VERSION, provider: deps.bank.name });
+  });
+
   if (cfg.MCP_ALLOWED_HOSTS.length) app.use(hostHeaderValidation(cfg.MCP_ALLOWED_HOSTS));
   else if (LOOPBACK_HOSTS.includes(cfg.MCP_HTTP_HOST)) app.use(localhostHostValidation());
 
@@ -57,10 +65,6 @@ export function createHttpApp(cfg: AppConfig, deps: HttpDeps) {
     }
     next();
   };
-
-  app.get('/health', (_req, res) => {
-    res.json({ status: 'ok', name: APP_NAME, version: APP_VERSION, provider: deps.bank.name });
-  });
 
   const authMiddleware = async (req: Request, res: Response, next: NextFunction): Promise<void> => {
     const ip = req.ip ?? 'unknown';

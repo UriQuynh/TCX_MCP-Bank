@@ -1,13 +1,34 @@
 {
   "name": "tcx-mcp-bank",
   "version": "0.1.0",
-  "description": "TCX MCP server - kết nối ngân hàng, tạo ví, gate bằng API key có scope",
-  "private": true,
+  "description": "MCP server (Model Context Protocol) để kết nối ngân hàng và tạo ví/tài khoản nhận tiền — mọi tool khoá sau API key có scope",
   "type": "module",
-  "license": "UNLICENSED",
+  "license": "MIT",
   "engines": {
     "node": ">=22"
   },
+  "keywords": [
+    "mcp",
+    "model-context-protocol",
+    "bank",
+    "wallet",
+    "fintech",
+    "claude",
+    "agent"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/UriQuynh/TCX_MCP-Bank.git"
+  },
+  "homepage": "https://github.com/UriQuynh/TCX_MCP-Bank#readme",
+  "bugs": {
+    "url": "https://github.com/UriQuynh/TCX_MCP-Bank/issues"
+  },
+  "files": [
+    "dist",
+    "README.md",
+    "LICENSE"
+  ],
   "bin": {
     "tcx-mcp-bank": "dist/index.js"
   },

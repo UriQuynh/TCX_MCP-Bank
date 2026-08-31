@@ -118,23 +118,34 @@ describe('http transport - session & body handling', () => {
     }
   });
 
-  it('Host header not in MCP_ALLOWED_HOSTS -> 403 Invalid Host', async () => {
+  it('/health luôn 200 bất kể Host header -> public, đăng ký trước hostHeaderValidation (Docker HEALTHCHECK gọi qua 127.0.0.1)', async () => {
     const { base, close } = await startApp({ MCP_HTTP_HOST: '0.0.0.0', MCP_ALLOWED_HOSTS: 'mcp.example', MCP_REQUIRE_HTTPS: 'false' });
     try {
-      const bad = await fetch(`${base}/health`);
+      const r = await fetch(`${base}/health`);
+      expect(r.status).toBe(200);
+      expect(((await r.json()) as any).status).toBe('ok');
+    } finally {
+      await close();
+    }
+  });
+
+  it('Host header not in MCP_ALLOWED_HOSTS -> 403 Invalid Host trên /mcp (route thật cần bảo vệ)', async () => {
+    const { base, close } = await startApp({ MCP_HTTP_HOST: '0.0.0.0', MCP_ALLOWED_HOSTS: 'mcp.example', MCP_REQUIRE_HTTPS: 'false' });
+    try {
+      const bad = await fetch(`${base}/mcp`, { method: 'POST', headers: JSON_HEADERS, body: JSON.stringify(INIT) });
       expect(bad.status).toBe(403);
       expect((((await bad.json()) as any)).error.message).toMatch(/Invalid Host/);
       // fetch/undici không cho ghi đè Host -> dùng node:http để gửi Host hợp lệ
       const goodStatus = await new Promise<number>((resolve, reject) => {
-        const u = new URL(`${base}/health`);
-        httpRequest({ host: u.hostname, port: u.port, path: '/health', headers: { Host: 'mcp.example' } }, (res) => {
+        const u = new URL(`${base}/mcp`);
+        const req = httpRequest({ method: 'POST', host: u.hostname, port: u.port, path: '/mcp', headers: { ...JSON_HEADERS, Host: 'mcp.example', Authorization: 'Bearer bad' } }, (res) => {
           res.resume();
           resolve(res.statusCode ?? 0);
-        })
-          .on('error', reject)
-          .end();
+        }).on('error', reject);
+        req.end(JSON.stringify(INIT));
       });
-      expect(goodStatus).toBe(200);
+      // Host hợp lệ -> qua khỏi hostHeaderValidation, request tiếp tục xử lý bình thường (401 vì key sai, không phải 403 Invalid Host)
+      expect(goodStatus).not.toBe(403);
     } finally {
       await close();
     }
