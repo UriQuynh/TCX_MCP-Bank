@@ -1,5 +1,8 @@
 import { createHmac, timingSafeEqual } from 'node:crypto';
+import { promises as dns } from 'node:dns';
+import { isIP } from 'node:net';
 import type { AuditLogger } from '../audit/audit-log.js';
+import { isPrivateIp } from '../bank/http-bank.provider.js';
 import type { ApplyIncomingResult, BankProvider, IncomingPaymentRecord } from '../bank/types.js';
 import { AppError } from '../errors.js';
 
@@ -36,10 +39,39 @@ export interface ForwardOptions {
   fetchImpl?: typeof fetch;
   attempts?: number;
   timeoutMs?: number;
+  allowInsecure?: boolean;
+}
+
+// Kiểm target KHÔNG trỏ về địa chỉ nội bộ — cùng guard với HttpBankProvider
+// (vá audit vòng 9, 2026-09-11: trước đây chỉ HttpBankProvider có SSRF guard,
+// đường forward-webhook này không có dù cũng POST tới 1 URL đọc từ env).
+// URL do người vận hành cấu hình (INCOMING_PAYMENT_FORWARD_URL), không phải
+// input tấn công trực tiếp — nhưng nếu .env trỏ nhầm/bị rebind DNS, guard này
+// chặn âm thầm POST payload báo có ra 1 service nội bộ không nên nhận nó.
+async function assertSafeForwardTarget(rawUrl: string): Promise<void> {
+  const u = new URL(rawUrl);
+  if (u.protocol !== 'https:') {
+    throw new AppError('PROVIDER_ERROR', 'INCOMING_PAYMENT_FORWARD_URL phải là https://');
+  }
+  const host = u.hostname.replace(/^\[|\]$/g, '');
+  const addrs = isIP(host) ? [host] : (await dns.lookup(host, { all: true })).map((a) => a.address);
+  for (const ip of addrs) {
+    if (isPrivateIp(ip)) {
+      throw new AppError('PROVIDER_ERROR', `INCOMING_PAYMENT_FORWARD_URL phân giải về địa chỉ nội bộ (${ip}) - bị chặn (SSRF)`);
+    }
+  }
 }
 
 // Chuyển tiếp bản ghi "báo có" sang hệ thống khác (vd TCX_Backend) với chữ ký riêng, retry có backoff.
 export async function forwardIncomingPayment(record: IncomingPaymentRecord, opts: ForwardOptions): Promise<boolean> {
+  if (!opts.allowInsecure) {
+    try {
+      await assertSafeForwardTarget(opts.url);
+    } catch (err) {
+      opts.audit.log({ transport: 'http', keyId: null, keyName: null, event: 'forward', outcome: 'error', code: 'SSRF_BLOCKED', reason: record.event_id });
+      throw err;
+    }
+  }
   const fetchImpl = opts.fetchImpl ?? fetch;
   const attempts = opts.attempts ?? 3;
   const body = JSON.stringify({ type: 'incoming_payment', data: record });

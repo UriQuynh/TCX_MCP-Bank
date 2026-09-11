@@ -179,7 +179,16 @@ export function createHttpApp(cfg: AppConfig, deps: HttpDeps) {
         audit: deps.audit,
         verify: { secret: cfg.BANK_WEBHOOK_SECRET, toleranceSec: cfg.BANK_WEBHOOK_TOLERANCE_SEC },
         ...(cfg.INCOMING_PAYMENT_FORWARD_URL && cfg.INCOMING_PAYMENT_FORWARD_SECRET
-          ? { forward: { url: cfg.INCOMING_PAYMENT_FORWARD_URL, secret: cfg.INCOMING_PAYMENT_FORWARD_SECRET, ...(deps.fetchImpl ? { fetchImpl: deps.fetchImpl } : {}) } }
+          ? {
+              forward: {
+                url: cfg.INCOMING_PAYMENT_FORWARD_URL,
+                secret: cfg.INCOMING_PAYMENT_FORWARD_SECRET,
+                // Cùng cờ sandbox dùng cho HttpBankProvider (vá audit vòng 9) —
+                // không thêm biến env riêng cho 1 guard cùng mục đích.
+                allowInsecure: cfg.BANK_API_ALLOW_INSECURE,
+                ...(deps.fetchImpl ? { fetchImpl: deps.fetchImpl } : {}),
+              },
+            }
           : {}),
         remoteIp: ip,
       },

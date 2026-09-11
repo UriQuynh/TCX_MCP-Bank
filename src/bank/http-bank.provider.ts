@@ -45,7 +45,6 @@ export class HttpBankProvider implements BankProvider {
   readonly name = 'http';
   readonly bankCode: string;
   private readonly base: URL;
-  private safeChecked = false;
 
   constructor(private readonly opts: HttpBankProviderOptions) {
     this.bankCode = opts.bankCode ?? 'BANK';
@@ -208,8 +207,18 @@ export class HttpBankProvider implements BankProvider {
 
   // ---- internals ----
 
+  // Re-check MỖI request, không cache kết quả (vá audit vòng 9, 2026-09-11):
+  // bản trước chỉ kiểm 1 lần rồi tin mãi mãi (`safeChecked`), để lọt cửa sổ
+  // DNS-rebinding — nếu ai kiểm soát được DNS của domain cấu hình trong
+  // `BANK_API_BASE_URL` (dù là domain admin tự đặt, không phải input tấn
+  // công trực tiếp) đổi bản ghi SAU lần check đầu, mọi request sau đó không
+  // còn bị kiểm lại. `dns.lookup` rẻ và tần suất gọi ở luồng này thấp (thao
+  // tác ví/chuyển khoản, không phải hot path), nên bỏ cache không đổi rõ rệt
+  // chi phí. Vẫn còn 1 khoảng TOCTOU nhỏ giữa lookup và `fetch()` tự resolve
+  // lại — chấp nhận được vì `fetch()` không cho chọn IP đích thủ công; muốn
+  // đóng triệt để cần pin IP đã verify vào request thật, chưa làm vì
+  // `BANK_PROVIDER=http` chưa dùng ở prod.
   private async assertSafeTarget(): Promise<void> {
-    if (this.safeChecked) return;
     const host = this.base.hostname.replace(/^\[|\]$/g, '');
     const addrs = isIP(host) ? [host] : (await dns.lookup(host, { all: true })).map((a) => a.address);
     for (const ip of addrs) {
@@ -217,7 +226,6 @@ export class HttpBankProvider implements BankProvider {
         throw new AppError('PROVIDER_ERROR', `BANK_API_BASE_URL phân giải về địa chỉ nội bộ (${ip}) - bị chặn (SSRF)`);
       }
     }
-    this.safeChecked = true;
   }
 
   private async request(

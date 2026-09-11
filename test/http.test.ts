@@ -32,7 +32,7 @@ describe('http transport auth', () => {
       MCP_HTTP_PORT: '0',
       API_KEYS_FILE: '/dev/null',
       BANK_WEBHOOK_SECRET: 'whsec_test',
-      INCOMING_PAYMENT_FORWARD_URL: 'https://backend.example/hook',
+      INCOMING_PAYMENT_FORWARD_URL: 'https://203.0.113.30/hook',
       INCOMING_PAYMENT_FORWARD_SECRET: 'fwd_test',
     });
     const built = createHttpApp(cfg, {
@@ -121,7 +121,7 @@ describe('incoming payment webhook + https guard', () => {
   it('rejects bad signature / stale timestamp, applies valid event once, forwards it', async () => {
     const bank = new MockBankProvider();
     const forwarded: any[] = [];
-    const cfg = loadConfig({ MCP_TRANSPORT: 'http', API_KEYS_FILE: '/dev/null', BANK_WEBHOOK_SECRET: 'whsec_test', INCOMING_PAYMENT_FORWARD_URL: 'https://backend.example/hook', INCOMING_PAYMENT_FORWARD_SECRET: 'fwd_test' });
+    const cfg = loadConfig({ MCP_TRANSPORT: 'http', API_KEYS_FILE: '/dev/null', BANK_WEBHOOK_SECRET: 'whsec_test', INCOMING_PAYMENT_FORWARD_URL: 'https://203.0.113.30/hook', INCOMING_PAYMENT_FORWARD_SECRET: 'fwd_test' });
     const built = createHttpApp(cfg, {
       store: makeStore(),
       audit: new AuditLogger({ filePath: null, stderr: false }),

@@ -70,7 +70,7 @@ describe('forwardIncomingPayment', () => {
   it('first attempt 200 -> true, one success audit entry', async () => {
     const audit = new CollectingAudit();
     const { fetchImpl, calls } = fetchSequence([200]);
-    expect(await forwardIncomingPayment(record, { url: 'https://b.example/hook', secret: 's', audit, fetchImpl })).toBe(true);
+    expect(await forwardIncomingPayment(record, { url: 'https://203.0.113.20/hook', secret: 's', audit, fetchImpl })).toBe(true);
     expect(calls).toHaveLength(1);
     expect(audit.entries.map((e) => e.outcome)).toEqual(['success']);
   });
@@ -79,7 +79,7 @@ describe('forwardIncomingPayment', () => {
     vi.useFakeTimers();
     const audit = new CollectingAudit();
     const { fetchImpl, calls } = fetchSequence([500, 200]);
-    const pending = forwardIncomingPayment(record, { url: 'https://b.example/hook', secret: 's', audit, fetchImpl });
+    const pending = forwardIncomingPayment(record, { url: 'https://203.0.113.20/hook', secret: 's', audit, fetchImpl });
     await vi.advanceTimersByTimeAsync(499);
     expect(calls).toHaveLength(1);
     await vi.advanceTimersByTimeAsync(1);
@@ -92,7 +92,7 @@ describe('forwardIncomingPayment', () => {
     vi.useFakeTimers();
     const audit = new CollectingAudit();
     const { fetchImpl, calls } = fetchSequence([503, 503, 503]);
-    const pending = forwardIncomingPayment(record, { url: 'https://b.example/hook', secret: 's', audit, fetchImpl });
+    const pending = forwardIncomingPayment(record, { url: 'https://203.0.113.20/hook', secret: 's', audit, fetchImpl });
     await vi.runAllTimersAsync();
     expect(await pending).toBe(false);
     expect(calls).toHaveLength(3);
@@ -102,11 +102,42 @@ describe('forwardIncomingPayment', () => {
     vi.useFakeTimers();
     const audit = new CollectingAudit();
     const { fetchImpl, calls } = fetchSequence([new TypeError('fetch failed'), 200]);
-    const pending = forwardIncomingPayment(record, { url: 'https://b.example/hook', secret: 's', audit, fetchImpl });
+    const pending = forwardIncomingPayment(record, { url: 'https://203.0.113.20/hook', secret: 's', audit, fetchImpl });
     await vi.runAllTimersAsync();
     expect(await pending).toBe(true);
     expect(calls).toHaveLength(2);
     expect(audit.entries[0]).toMatchObject({ outcome: 'error', code: 'TypeError' });
+  });
+
+  // Vá audit vòng 9 (2026-09-11): trước đây forwardIncomingPayment không có
+  // SSRF guard nào — 1 URL trỏ về địa chỉ nội bộ (env cấu hình sai/DNS rebind)
+  // sẽ được POST payload báo có tới đó mà không ai chặn.
+  it('forward URL resolving to a private IP -> rejected, fetch never called, error audited', async () => {
+    const audit = new CollectingAudit();
+    const { fetchImpl, calls } = fetchSequence([200]);
+    await expect(
+      forwardIncomingPayment(record, { url: 'https://127.0.0.1/hook', secret: 's', audit, fetchImpl }),
+    ).rejects.toMatchObject({ code: 'PROVIDER_ERROR', message: expect.stringMatching(/SSRF/) });
+    expect(calls).toHaveLength(0);
+    expect(audit.entries).toEqual([expect.objectContaining({ outcome: 'error', code: 'SSRF_BLOCKED' })]);
+  });
+
+  it('non-https forward URL -> rejected even before DNS check', async () => {
+    const audit = new CollectingAudit();
+    const { fetchImpl, calls } = fetchSequence([200]);
+    await expect(
+      forwardIncomingPayment(record, { url: 'http://203.0.113.20/hook', secret: 's', audit, fetchImpl }),
+    ).rejects.toMatchObject({ code: 'PROVIDER_ERROR', message: expect.stringMatching(/https/) });
+    expect(calls).toHaveLength(0);
+  });
+
+  it('allowInsecure -> skips the SSRF guard', async () => {
+    const audit = new CollectingAudit();
+    const { fetchImpl, calls } = fetchSequence([200]);
+    expect(
+      await forwardIncomingPayment(record, { url: 'https://127.0.0.1/hook', secret: 's', audit, fetchImpl, allowInsecure: true }),
+    ).toBe(true);
+    expect(calls).toHaveLength(1);
   });
 });
 
