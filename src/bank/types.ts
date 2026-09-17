@@ -135,6 +135,11 @@ export interface IncomingPaymentRecord extends IncomingPayment {
   applied: boolean;
   transaction_id: string | null;
   received_at: string;
+  // Mốc forward xuống hệ thống khác (TCX_Backend) THÀNH CÔNG — null nghĩa là
+  // chưa forward hoặc lần trước thất bại (F08, RE-AUDIT 2026-09-17). Tách
+  // khỏi `applied`/`duplicate`: 1 bản ghi có thể applied=true mà vẫn chưa
+  // forward xong nếu downstream đang lỗi/process từng restart giữa chừng.
+  forwarded_at: string | null;
 }
 
 export interface ApplyIncomingResult {
@@ -146,6 +151,9 @@ export interface ListIncomingFilter {
   wallet_id?: string;
   limit: number;
   since?: string;
+  // Chỉ trả bản ghi CHƯA forward thành công (forwarded_at is null) — dùng cho
+  // outbox sweep định kỳ (F08), không phải cho API liệt kê thông thường.
+  unforwardedOnly?: boolean;
 }
 
 export interface BankProvider {
@@ -164,5 +172,9 @@ export interface BankProvider {
   parseIncomingPayment(body: unknown): IncomingPayment;
   applyIncomingPayment(p: IncomingPayment): Promise<ApplyIncomingResult>;
   listIncomingPayments(filter: ListIncomingFilter): Promise<IncomingPaymentRecord[]>;
+  // Đánh dấu 1 bản ghi "báo có" đã forward xuống hệ thống khác THÀNH CÔNG
+  // (F08, RE-AUDIT 2026-09-17) — outbox sweep định kỳ dùng để biết bản ghi
+  // nào còn nợ forward sau khi process restart/downstream outage kéo dài.
+  markIncomingPaymentForwarded(eventId: string, forwardedAt: string): Promise<void>;
   healthCheck(): Promise<{ ok: boolean; detail?: string }>;
 }

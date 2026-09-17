@@ -36,7 +36,10 @@ export interface HttpBankProviderOptions {
   fetchImpl?: typeof fetch;
   bankCode?: string;
   // Lưu bản ghi webhook "báo có" (ngân hàng đã ghi có, ta chỉ ghi nhận + tra cứu lại)
-  incomingStore: Pick<LedgerStore, 'transaction' | 'getIncomingPayment' | 'insertIncomingPayment' | 'listIncomingPayments'>;
+  incomingStore: Pick<
+    LedgerStore,
+    'transaction' | 'getIncomingPayment' | 'insertIncomingPayment' | 'listIncomingPayments' | 'markIncomingPaymentForwarded'
+  >;
 }
 
 // Adapter REST tổng quát. Contract endpoint/response mặc định mô tả trong README ("HTTP provider");
@@ -183,7 +186,14 @@ export class HttpBankProvider implements BankProvider {
     } catch {
       walletId = null;
     }
-    const record: IncomingPaymentRecord = { ...p, wallet_id: walletId, applied: true, transaction_id: p.reference ?? null, received_at: new Date().toISOString() };
+    const record: IncomingPaymentRecord = {
+      ...p,
+      wallet_id: walletId,
+      applied: true,
+      transaction_id: p.reference ?? null,
+      received_at: new Date().toISOString(),
+      forwarded_at: null,
+    };
     return this.opts.incomingStore.transaction(() => {
       const again = this.opts.incomingStore.getIncomingPayment(p.event_id);
       if (again) return { record: again, duplicate: true };
@@ -194,6 +204,10 @@ export class HttpBankProvider implements BankProvider {
 
   async listIncomingPayments(filter: ListIncomingFilter): Promise<IncomingPaymentRecord[]> {
     return this.opts.incomingStore.listIncomingPayments(filter);
+  }
+
+  async markIncomingPaymentForwarded(eventId: string, forwardedAt: string): Promise<void> {
+    this.opts.incomingStore.markIncomingPaymentForwarded(eventId, forwardedAt);
   }
 
   async healthCheck(): Promise<{ ok: boolean; detail?: string }> {

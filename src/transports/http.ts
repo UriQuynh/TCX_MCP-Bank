@@ -13,7 +13,7 @@ import type { BankProvider } from '../bank/types.js';
 import { APP_NAME, APP_VERSION, LOOPBACK_HOSTS, type AppConfig } from '../config.js';
 import { AuthError } from '../errors.js';
 import { createBankMcpServer } from '../server.js';
-import { handleIncomingPaymentWebhook } from '../webhooks/incoming-payment.js';
+import { handleIncomingPaymentWebhook, sweepUnforwardedIncomingPayments } from '../webhooks/incoming-payment.js';
 
 export interface HttpDeps {
   store: ApiKeyStore;
@@ -31,6 +31,12 @@ interface Session {
 
 const AUTH_FAIL_PER_MINUTE_PER_IP = 30;
 const WEBHOOK_PER_MINUTE_PER_IP = 300;
+// F08 (RE-AUDIT 2026-09-17): chu kỳ quét outbox "báo có" chưa forward thành
+// công — độc lập với 3 lần retry trong-request của forwardIncomingPayment()
+// (sống vài giây, mất khi process restart). 5 phút đủ nhanh để không để
+// backend lệch sổ quá lâu, đủ thưa để không tạo tải lặp vô ích khi downstream
+// còn đang down dài hơn thế.
+const OUTBOX_SWEEP_INTERVAL_MS = 5 * 60_000;
 
 function headerStr(v: string | string[] | undefined): string | undefined {
   return Array.isArray(v) ? v[0] : v;
@@ -216,8 +222,41 @@ export function createHttpApp(cfg: AppConfig, deps: HttpDeps) {
   }, 60_000);
   sweeper.unref();
 
+  // F08 (RE-AUDIT 2026-09-17): outbox sweep — chỉ bật khi cấu hình forward đã
+  // có đủ url+secret (cùng điều kiện dùng để bật forward trong route webhook
+  // bên dưới). `sweeping` chặn chồng lượt nếu 1 lượt sweep (N request HTTP ra
+  // ngoài) chạy lâu hơn cả interval.
+  const forwardUrl = cfg.INCOMING_PAYMENT_FORWARD_URL;
+  const forwardSecret = cfg.INCOMING_PAYMENT_FORWARD_SECRET;
+  let sweeping = false;
+  const outboxSweeper =
+    forwardUrl && forwardSecret
+      ? setInterval(() => {
+          if (sweeping) return;
+          sweeping = true;
+          void sweepUnforwardedIncomingPayments({
+            bank: deps.bank,
+            forward: {
+              url: forwardUrl,
+              secret: forwardSecret,
+              allowInsecure: cfg.BANK_API_ALLOW_INSECURE,
+              ...(deps.fetchImpl ? { fetchImpl: deps.fetchImpl } : {}),
+            },
+            audit: deps.audit,
+          })
+            .catch((err) => {
+              process.stderr.write(`[${APP_NAME}] outbox sweep lỗi: ${(err as Error).message}\n`);
+            })
+            .finally(() => {
+              sweeping = false;
+            });
+        }, OUTBOX_SWEEP_INTERVAL_MS)
+      : undefined;
+  outboxSweeper?.unref();
+
   const closeAll = async (): Promise<void> => {
     clearInterval(sweeper);
+    if (outboxSweeper) clearInterval(outboxSweeper);
     await Promise.all([...sessions.values()].map((s) => s.transport.close().catch(() => undefined)));
     sessions.clear();
   };

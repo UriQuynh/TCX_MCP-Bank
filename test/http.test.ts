@@ -154,15 +154,22 @@ describe('incoming payment webhook + https guard', () => {
       expect(j.duplicate).toBe(false);
       expect((await bank.getBalance(w.id)).balance).toBe(120_000);
 
-      const again = await fetch(url, { method: 'POST', headers: { 'content-type': 'application/json', 'x-bank-timestamp': ts, 'x-bank-signature': sign('whsec_test', ts, body) }, body });
-      expect((((await again.json()) as any)).duplicate).toBe(true);
-      expect((await bank.getBalance(w.id)).balance).toBe(120_000);
-
+      // Chờ forward (fire-and-forget) của request đầu hoàn tất TRƯỚC khi gửi
+      // request trùng — F08 (RE-AUDIT 2026-09-17): forwarded_at chỉ được set
+      // sau khi forward thành công, nên phải đợi nó xong để bước kiểm dưới
+      // đây (không forward lại lần 2) không bị race với chính request đầu.
       await new Promise((r) => setTimeout(r, 50));
       expect(forwarded).toHaveLength(1);
       expect(forwarded[0].body.data.event_id).toBe('bank-evt-100');
       const h = forwarded[0].headers as Record<string, string>;
       expect(h['X-TCX-Signature']).toBe(sign('fwd_test', h['X-TCX-Timestamp']!, JSON.stringify(forwarded[0].body)));
+
+      // Ngân hàng gửi lại ĐÚNG event đã forward thành công -> không forward lại lần 2.
+      const again = await fetch(url, { method: 'POST', headers: { 'content-type': 'application/json', 'x-bank-timestamp': ts, 'x-bank-signature': sign('whsec_test', ts, body) }, body });
+      expect((((await again.json()) as any)).duplicate).toBe(true);
+      expect((await bank.getBalance(w.id)).balance).toBe(120_000);
+      await new Promise((r) => setTimeout(r, 50));
+      expect(forwarded).toHaveLength(1);
 
       const invalid = await fetch(url, { method: 'POST', headers: { 'content-type': 'application/json', 'x-bank-timestamp': ts, 'x-bank-signature': sign('whsec_test', ts, '{"amount":-1}') }, body: '{"amount":-1}' });
       expect(invalid.status).toBe(400);
@@ -171,6 +178,56 @@ describe('incoming payment webhook + https guard', () => {
       await new Promise((r) => server.close(r));
     }
   });
+
+  // F08 (RE-AUDIT 2026-09-17): trước bản vá, `duplicate=true` bỏ hẳn forward
+  // — nếu lần đầu forward thất bại (downstream down) và ngân hàng gửi lại
+  // ĐÚNG event đó (cách redelivery tự nhiên nhất vì webhook luôn trả 200),
+  // bản ghi không bao giờ được forward. Giờ điều kiện đúng là "chưa forward
+  // thành công" (forwarded_at null), không phải "lần đầu thấy event".
+  it('forward lần đầu lỗi -> ngân hàng gửi lại đúng event (duplicate) vẫn thử forward lại và thành công', async () => {
+    const bank = new MockBankProvider();
+    const forwarded: any[] = [];
+    let failFirst = true;
+    const cfg = loadConfig({ MCP_TRANSPORT: 'http', API_KEYS_FILE: '/dev/null', BANK_WEBHOOK_SECRET: 'whsec_test', INCOMING_PAYMENT_FORWARD_URL: 'https://203.0.113.30/hook', INCOMING_PAYMENT_FORWARD_SECRET: 'fwd_test' });
+    const built = createHttpApp(cfg, {
+      store: makeStore(),
+      audit: new AuditLogger({ filePath: null, stderr: false }),
+      rateLimiter: new MemoryRateLimiter(),
+      bank,
+      fetchImpl: (async (_u: unknown, init?: RequestInit) => {
+        // 3 lần thử trong-request của forwardIncomingPayment() đều lỗi lần
+        // đầu (giả lập downstream down suốt request 1), rồi khoẻ lại.
+        if (failFirst) return new Response('down', { status: 503 });
+        forwarded.push(JSON.parse(String(init?.body)));
+        return new Response('ok', { status: 200 });
+      }) as unknown as typeof fetch,
+    });
+    const server = await new Promise<Server>((resolve) => { const s = built.app.listen(0, '127.0.0.1', () => resolve(s)); });
+    const base = `http://127.0.0.1:${(server.address() as { port: number }).port}`;
+    try {
+      const w = await bank.createWallet({ owner_ref: 'u1', owner_name: 'A' });
+      const body = JSON.stringify({ event_id: 'bank-evt-retry-1', account_number: w.account_number, amount: 50_000 });
+      const ts = String(Math.floor(Date.now() / 1000));
+      const url = `${base}/webhooks/bank/incoming`;
+      const headers = { 'content-type': 'application/json', 'x-bank-timestamp': ts, 'x-bank-signature': sign('whsec_test', ts, body) };
+
+      const first = await fetch(url, { method: 'POST', headers, body });
+      expect(((await first.json()) as any).duplicate).toBe(false);
+      // Đợi hết 3 lần thử trong-request (backoff 500ms+1000ms) của lần đầu, đều lỗi.
+      await new Promise((r) => setTimeout(r, 2000));
+      expect(forwarded).toHaveLength(0);
+
+      failFirst = false;
+      const redelivered = await fetch(url, { method: 'POST', headers, body });
+      expect(((await redelivered.json()) as any).duplicate).toBe(true);
+      await new Promise((r) => setTimeout(r, 50));
+      expect(forwarded).toHaveLength(1);
+      expect(forwarded[0].data.event_id).toBe('bank-evt-retry-1');
+    } finally {
+      await built.closeAll();
+      await new Promise((r) => server.close(r));
+    }
+  }, 10_000);
 
   it('webhook disabled without secret -> 404', async () => {
     const cfg = loadConfig({ MCP_TRANSPORT: 'http', API_KEYS_FILE: '/dev/null' });

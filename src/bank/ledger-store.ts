@@ -31,6 +31,7 @@ export interface LedgerStore {
   getIncomingPayment(eventId: string): IncomingPaymentRecord | null;
   insertIncomingPayment(r: IncomingPaymentRecord): void;
   listIncomingPayments(filter: ListIncomingFilter): IncomingPaymentRecord[];
+  markIncomingPaymentForwarded(eventId: string, forwardedAt: string): void;
   close(): void;
 }
 
@@ -109,9 +110,15 @@ export class MemoryLedgerStore implements LedgerStore {
     return [...this.incoming.values()]
       .filter((r) => !filter.wallet_id || r.wallet_id === filter.wallet_id)
       .filter((r) => new Date(r.received_at).getTime() >= since)
+      .filter((r) => !filter.unforwardedOnly || r.forwarded_at === null)
       .sort((a, b) => (a.received_at < b.received_at ? 1 : -1))
       .slice(0, filter.limit)
       .map((r) => ({ ...r }));
+  }
+
+  markIncomingPaymentForwarded(eventId: string, forwardedAt: string): void {
+    const r = this.incoming.get(eventId);
+    if (r) r.forwarded_at = forwardedAt;
   }
 
   close(): void {
@@ -167,7 +174,8 @@ create table if not exists incoming_payments (
   occurred_at text not null,
   received_at text not null,
   applied integer not null,
-  transaction_id text
+  transaction_id text,
+  forwarded_at text
 );
 create index if not exists idx_incoming_wallet_received on incoming_payments(wallet_id, received_at);
 `;
@@ -184,6 +192,22 @@ export class SqliteLedgerStore implements LedgerStore {
     this.db = new DatabaseSync(filePath);
     this.db.exec('pragma journal_mode = wal; pragma foreign_keys = on; pragma busy_timeout = 5000;');
     this.db.exec(SCHEMA);
+    this.migrate();
+  }
+
+  // `create table if not exists` không thêm cột mới vào bảng đã tồn tại từ
+  // trước khi cột đó được đưa vào SCHEMA — file ledger.sqlite deploy trước
+  // F08 (RE-AUDIT 2026-09-17) sẽ thiếu `forwarded_at`. Kiểm bằng
+  // `pragma table_info` rồi `alter table` nếu còn thiếu, idempotent mỗi lần
+  // khởi động (không cần bảng version riêng cho đúng 1 cột).
+  private migrate(): void {
+    const cols = this.db.prepare('pragma table_info(incoming_payments)').all() as Array<{ name: string }>;
+    if (!cols.some((c) => c.name === 'forwarded_at')) {
+      this.db.exec('alter table incoming_payments add column forwarded_at text');
+    }
+    // Partial index tách khỏi SCHEMA: chỉ tạo được SAU khi cột forwarded_at
+    // chắc chắn tồn tại (fresh install lẫn upgrade từ DB cũ ở nhánh trên).
+    this.db.exec('create index if not exists idx_incoming_unforwarded on incoming_payments(received_at) where forwarded_at is null');
   }
 
   transaction<T>(fn: () => T): T {
@@ -290,8 +314,8 @@ export class SqliteLedgerStore implements LedgerStore {
   insertIncomingPayment(r: IncomingPaymentRecord): void {
     this.db
       .prepare(
-        `insert into incoming_payments (event_id, wallet_id, bank_code, account_number, amount, description, reference, payer_name, payer_account, occurred_at, received_at, applied, transaction_id)
-         values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        `insert into incoming_payments (event_id, wallet_id, bank_code, account_number, amount, description, reference, payer_name, payer_account, occurred_at, received_at, applied, transaction_id, forwarded_at)
+         values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       )
       .run(
         r.event_id,
@@ -307,6 +331,7 @@ export class SqliteLedgerStore implements LedgerStore {
         r.received_at,
         r.applied ? 1 : 0,
         r.transaction_id,
+        r.forwarded_at ?? null,
       );
   }
 
@@ -321,9 +346,16 @@ export class SqliteLedgerStore implements LedgerStore {
       conds.push('received_at >= ?');
       args.push(filter.since);
     }
+    if (filter.unforwardedOnly) {
+      conds.push('forwarded_at is null');
+    }
     const where = conds.length ? `where ${conds.join(' and ')}` : '';
     const rows = this.db.prepare(`select * from incoming_payments ${where} order by received_at desc limit ?`).all(...(args as never[]), filter.limit) as Row[];
     return rows.map((r) => this.rowToIncoming(r));
+  }
+
+  markIncomingPaymentForwarded(eventId: string, forwardedAt: string): void {
+    this.db.prepare('update incoming_payments set forwarded_at = ? where event_id = ?').run(forwardedAt, eventId);
   }
 
   close(): void {
@@ -355,6 +387,7 @@ export class SqliteLedgerStore implements LedgerStore {
       received_at: String(r.received_at),
       applied: Number(r.applied) === 1,
       transaction_id: r.transaction_id == null ? null : String(r.transaction_id),
+      forwarded_at: r.forwarded_at == null ? null : String(r.forwarded_at),
       ...(r.bank_code ? { bank_code: String(r.bank_code) } : {}),
       ...(r.description ? { description: String(r.description) } : {}),
       ...(r.reference ? { reference: String(r.reference) } : {}),

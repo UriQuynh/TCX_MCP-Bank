@@ -99,6 +99,48 @@ export async function forwardIncomingPayment(record: IncomingPaymentRecord, opts
   return false;
 }
 
+export interface OutboxDeps {
+  bank: BankProvider;
+  forward: Omit<ForwardOptions, 'audit'>;
+  audit: AuditLogger;
+}
+
+// F08 (RE-AUDIT 2026-09-17): 1 điểm dùng chung cho cả webhook handler (forward
+// ngay) và sweep định kỳ (forward bù) — tránh 2 chỗ tự viết lại "forward rồi
+// đánh dấu forwarded_at". forwardIncomingPayment() có thể THROW (vd
+// assertSafeForwardTarget chặn SSRF) chứ không chỉ trả false — bọc try/catch ở
+// đây để không bao giờ là 1 unhandled rejection khi gọi kiểu "void ...()".
+export async function attemptForwardAndMark(record: IncomingPaymentRecord, deps: OutboxDeps): Promise<void> {
+  try {
+    const ok = await forwardIncomingPayment(record, { ...deps.forward, audit: deps.audit });
+    if (ok) {
+      await deps.bank.markIncomingPaymentForwarded(record.event_id, new Date().toISOString());
+    }
+  } catch (err) {
+    deps.audit.log({
+      transport: 'http',
+      keyId: null,
+      keyName: null,
+      event: 'forward',
+      outcome: 'error',
+      code: 'FORWARD_ATTEMPT_FAILED',
+      reason: `${record.event_id}: ${(err as Error).message}`,
+    });
+  }
+}
+
+// Quét các bản ghi CHƯA forward thành công (forwarded_at is null) và thử lại —
+// đây là phần "outbox" thật sự bền qua restart: retry trong forwardIncomingPayment()
+// chỉ sống trong 1 lần gọi HTTP, mất hết nếu process chết giữa chừng hoặc
+// downstream outage kéo dài hơn vài giây. Gọi định kỳ từ transports/http.ts.
+export async function sweepUnforwardedIncomingPayments(deps: OutboxDeps, limit = 100): Promise<number> {
+  const pending = await deps.bank.listIncomingPayments({ limit, unforwardedOnly: true });
+  for (const record of pending) {
+    await attemptForwardAndMark(record, deps);
+  }
+  return pending.length;
+}
+
 export interface HandleWebhookDeps {
   bank: BankProvider;
   audit: AuditLogger;
@@ -151,8 +193,16 @@ export async function handleIncomingPaymentWebhook(
     tool: 'incoming_payment',
     params: { event_id: record.event_id, account_number: record.account_number, amount: record.amount, wallet_id: record.wallet_id, applied: record.applied, duplicate },
   });
-  if (!duplicate && deps.forward) {
-    void forwardIncomingPayment(record, { ...deps.forward, audit: deps.audit });
+  // F08 (RE-AUDIT 2026-09-17): trước đây bỏ hẳn forward khi `duplicate=true`
+  // — nếu lần đầu forward thất bại (downstream down) và ngân hàng gửi lại
+  // ĐÚNG event đó (webhook redelivery, cách tự nhiên nhất để "retry" trong
+  // thực tế vì handler luôn trả 200), bản ghi sẽ KHÔNG BAO GIỜ được forward
+  // — mất đồng bộ vĩnh viễn cho tới khi ai đó replay thủ công. Điều kiện
+  // đúng là "chưa forward thành công" (forwarded_at null), không phải "lần
+  // đầu thấy event". Sweep định kỳ (transports/http.ts) xử lý nốt phần còn
+  // lại nếu request cụ thể này chết trước khi awaited xong.
+  if (deps.forward && !record.forwarded_at) {
+    void attemptForwardAndMark(record, { bank: deps.bank, forward: deps.forward, audit: deps.audit });
   }
   return {
     status: 200,

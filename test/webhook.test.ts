@@ -3,7 +3,13 @@ import { afterEach, describe, expect, it, vi } from 'vitest';
 import { MockBankProvider } from '../src/bank/mock-bank.provider.js';
 import type { IncomingPaymentRecord } from '../src/bank/types.js';
 import { AppError } from '../src/errors.js';
-import { forwardIncomingPayment, handleIncomingPaymentWebhook, verifyWebhookSignature } from '../src/webhooks/incoming-payment.js';
+import {
+  attemptForwardAndMark,
+  forwardIncomingPayment,
+  handleIncomingPaymentWebhook,
+  sweepUnforwardedIncomingPayments,
+  verifyWebhookSignature,
+} from '../src/webhooks/incoming-payment.js';
 import { CollectingAudit } from './helpers.js';
 
 const NOW_MS = 1_700_000_000_000;
@@ -53,6 +59,7 @@ const record: IncomingPaymentRecord = {
   received_at: '2026-08-28T10:00:01.000Z',
   applied: true,
   transaction_id: 'txn_1',
+  forwarded_at: null,
 };
 
 function fetchSequence(statuses: Array<number | Error>) {
@@ -138,6 +145,86 @@ describe('forwardIncomingPayment', () => {
       await forwardIncomingPayment(record, { url: 'https://127.0.0.1/hook', secret: 's', audit, fetchImpl, allowInsecure: true }),
     ).toBe(true);
     expect(calls).toHaveLength(1);
+  });
+});
+
+/**
+ * F08 (RE-AUDIT 2026-09-17) — outbox: attemptForwardAndMark() là điểm dùng
+ * chung cho cả webhook handler và sweep định kỳ; test trực tiếp trên
+ * MockBankProvider thật (không mock lại store) để chứng minh forwarded_at
+ * thực sự được ghi/đọc đúng qua BankProvider interface.
+ */
+describe('attemptForwardAndMark / sweepUnforwardedIncomingPayments', () => {
+  it('forward thành công -> markIncomingPaymentForwarded được gọi, record sau đó có forwarded_at', async () => {
+    const bank = new MockBankProvider();
+    const w = await bank.createWallet({ owner_ref: 'u1', owner_name: 'A' });
+    const { record } = await bank.applyIncomingPayment({
+      event_id: 'e1',
+      account_number: w.account_number,
+      amount: 1000,
+      occurred_at: new Date().toISOString(),
+    });
+    expect(record.forwarded_at).toBeNull();
+
+    const audit = new CollectingAudit();
+    const { fetchImpl, calls } = fetchSequence([200]);
+    await attemptForwardAndMark(record, { bank, forward: { url: 'https://203.0.113.20/hook', secret: 's', fetchImpl }, audit });
+
+    expect(calls).toHaveLength(1);
+    const [after] = await bank.listIncomingPayments({ limit: 10 });
+    expect(after?.forwarded_at).not.toBeNull();
+  });
+
+  it('forward thất bại cả 3 lần -> KHÔNG markIncomingPaymentForwarded, record vẫn unforwarded', async () => {
+    const bank = new MockBankProvider();
+    const w = await bank.createWallet({ owner_ref: 'u1', owner_name: 'A' });
+    const { record } = await bank.applyIncomingPayment({
+      event_id: 'e2',
+      account_number: w.account_number,
+      amount: 1000,
+      occurred_at: new Date().toISOString(),
+    });
+
+    const audit = new CollectingAudit();
+    const { fetchImpl } = fetchSequence([503, 503, 503]);
+    await attemptForwardAndMark(record, { bank, forward: { url: 'https://203.0.113.20/hook', secret: 's', fetchImpl }, audit });
+
+    const [after] = await bank.listIncomingPayments({ limit: 10, unforwardedOnly: true });
+    expect(after?.event_id).toBe('e2');
+  });
+
+  it('assertSafeForwardTarget throw (SSRF) -> attemptForwardAndMark KHÔNG throw ra ngoài (không unhandled rejection)', async () => {
+    const bank = new MockBankProvider();
+    const w = await bank.createWallet({ owner_ref: 'u1', owner_name: 'A' });
+    const { record } = await bank.applyIncomingPayment({
+      event_id: 'e3',
+      account_number: w.account_number,
+      amount: 1000,
+      occurred_at: new Date().toISOString(),
+    });
+
+    const audit = new CollectingAudit();
+    await expect(
+      attemptForwardAndMark(record, { bank, forward: { url: 'https://127.0.0.1/hook', secret: 's' }, audit }),
+    ).resolves.toBeUndefined();
+    expect(audit.entries).toContainEqual(expect.objectContaining({ outcome: 'error', code: 'FORWARD_ATTEMPT_FAILED' }));
+  });
+
+  it('sweepUnforwardedIncomingPayments: forward bù cho các bản ghi cũ chưa forward, bỏ qua bản đã forward', async () => {
+    const bank = new MockBankProvider();
+    const w = await bank.createWallet({ owner_ref: 'u1', owner_name: 'A' });
+    const { record: r1 } = await bank.applyIncomingPayment({ event_id: 'e10', account_number: w.account_number, amount: 100, occurred_at: new Date().toISOString() });
+    await bank.applyIncomingPayment({ event_id: 'e11', account_number: w.account_number, amount: 200, occurred_at: new Date().toISOString() });
+    await bank.markIncomingPaymentForwarded(r1.event_id, new Date().toISOString());
+
+    const audit = new CollectingAudit();
+    const { fetchImpl, calls } = fetchSequence([200]);
+    const count = await sweepUnforwardedIncomingPayments({ bank, forward: { url: 'https://203.0.113.20/hook', secret: 's', fetchImpl }, audit });
+
+    expect(count).toBe(1);
+    expect(calls).toHaveLength(1);
+    const remaining = await bank.listIncomingPayments({ limit: 10, unforwardedOnly: true });
+    expect(remaining).toHaveLength(0);
   });
 });
 

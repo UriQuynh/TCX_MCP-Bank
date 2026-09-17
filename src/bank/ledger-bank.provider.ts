@@ -233,6 +233,7 @@ export class LedgerBankProvider implements BankProvider {
         applied: canApply,
         transaction_id: txnId,
         received_at: this.now().toISOString(),
+        forwarded_at: null,
       };
       this.store.insertIncomingPayment(record);
       return { record, duplicate: false };
@@ -241,6 +242,10 @@ export class LedgerBankProvider implements BankProvider {
 
   async listIncomingPayments(filter: ListIncomingFilter): Promise<IncomingPaymentRecord[]> {
     return this.store.listIncomingPayments(filter);
+  }
+
+  async markIncomingPaymentForwarded(eventId: string, forwardedAt: string): Promise<void> {
+    this.store.markIncomingPaymentForwarded(eventId, forwardedAt);
   }
 
   async createPaymentQr(req: PaymentQrRequest): Promise<PaymentQrResult> {
