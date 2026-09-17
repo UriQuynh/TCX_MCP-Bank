@@ -32,7 +32,23 @@ export interface LedgerStore {
   insertIncomingPayment(r: IncomingPaymentRecord): void;
   listIncomingPayments(filter: ListIncomingFilter): IncomingPaymentRecord[];
   markIncomingPaymentForwarded(eventId: string, forwardedAt: string): void;
+  recordForwardAttempt(eventId: string, attemptedAt: string): void;
   close(): void;
+}
+
+// V06 (RE-AUDIT 2026-09-17): sweep outbox (unforwardedOnly) không được sắp
+// theo received_at desc như listing thường — bản ghi chưa từng thử
+// (last_attempt_at null) đi trước hết (FIFO theo received_at giữa chúng với
+// nhau), rồi tới bản đã thử theo last_attempt_at asc (thử lâu nhất trước).
+// Round-robin công bằng: 1 nhóm bản ghi lỗi dai dẳng không còn chiếm hết
+// "limit" của mọi lượt sweep, chặn các bản ghi khác không bao giờ được thử.
+function sweepOrThenSort(a: IncomingPaymentRecord, b: IncomingPaymentRecord, unforwardedOnly?: boolean): number {
+  if (!unforwardedOnly) return a.received_at < b.received_at ? 1 : -1;
+  const aTried = a.last_attempt_at !== null;
+  const bTried = b.last_attempt_at !== null;
+  if (aTried !== bTried) return aTried ? 1 : -1;
+  if (!aTried) return a.received_at < b.received_at ? -1 : 1;
+  return a.last_attempt_at! < b.last_attempt_at! ? -1 : 1;
 }
 
 export class MemoryLedgerStore implements LedgerStore {
@@ -111,7 +127,7 @@ export class MemoryLedgerStore implements LedgerStore {
       .filter((r) => !filter.wallet_id || r.wallet_id === filter.wallet_id)
       .filter((r) => new Date(r.received_at).getTime() >= since)
       .filter((r) => !filter.unforwardedOnly || r.forwarded_at === null)
-      .sort((a, b) => (a.received_at < b.received_at ? 1 : -1))
+      .sort((a, b) => sweepOrThenSort(a, b, filter.unforwardedOnly))
       .slice(0, filter.limit)
       .map((r) => ({ ...r }));
   }
@@ -119,6 +135,11 @@ export class MemoryLedgerStore implements LedgerStore {
   markIncomingPaymentForwarded(eventId: string, forwardedAt: string): void {
     const r = this.incoming.get(eventId);
     if (r) r.forwarded_at = forwardedAt;
+  }
+
+  recordForwardAttempt(eventId: string, attemptedAt: string): void {
+    const r = this.incoming.get(eventId);
+    if (r) r.last_attempt_at = attemptedAt;
   }
 
   close(): void {
@@ -175,7 +196,8 @@ create table if not exists incoming_payments (
   received_at text not null,
   applied integer not null,
   transaction_id text,
-  forwarded_at text
+  forwarded_at text,
+  last_attempt_at text
 );
 create index if not exists idx_incoming_wallet_received on incoming_payments(wallet_id, received_at);
 `;
@@ -205,9 +227,17 @@ export class SqliteLedgerStore implements LedgerStore {
     if (!cols.some((c) => c.name === 'forwarded_at')) {
       this.db.exec('alter table incoming_payments add column forwarded_at text');
     }
+    // V06 (RE-AUDIT 2026-09-17): DB nâng cấp từ bản chỉ có F08 (forwarded_at,
+    // chưa có last_attempt_at) cũng phải vá thêm cột này, không chỉ fresh install.
+    if (!cols.some((c) => c.name === 'last_attempt_at')) {
+      this.db.exec('alter table incoming_payments add column last_attempt_at text');
+    }
     // Partial index tách khỏi SCHEMA: chỉ tạo được SAU khi cột forwarded_at
     // chắc chắn tồn tại (fresh install lẫn upgrade từ DB cũ ở nhánh trên).
-    this.db.exec('create index if not exists idx_incoming_unforwarded on incoming_payments(received_at) where forwarded_at is null');
+    // Sắp theo last_attempt_at (không phải received_at) để khớp thứ tự sweep
+    // round-robin thật sự dùng (V06) — xem sweepUnforwardedIncomingPayments.
+    this.db.exec('drop index if exists idx_incoming_unforwarded');
+    this.db.exec('create index if not exists idx_incoming_unforwarded on incoming_payments(last_attempt_at) where forwarded_at is null');
   }
 
   transaction<T>(fn: () => T): T {
@@ -314,8 +344,8 @@ export class SqliteLedgerStore implements LedgerStore {
   insertIncomingPayment(r: IncomingPaymentRecord): void {
     this.db
       .prepare(
-        `insert into incoming_payments (event_id, wallet_id, bank_code, account_number, amount, description, reference, payer_name, payer_account, occurred_at, received_at, applied, transaction_id, forwarded_at)
-         values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        `insert into incoming_payments (event_id, wallet_id, bank_code, account_number, amount, description, reference, payer_name, payer_account, occurred_at, received_at, applied, transaction_id, forwarded_at, last_attempt_at)
+         values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       )
       .run(
         r.event_id,
@@ -332,6 +362,7 @@ export class SqliteLedgerStore implements LedgerStore {
         r.applied ? 1 : 0,
         r.transaction_id,
         r.forwarded_at ?? null,
+        r.last_attempt_at ?? null,
       );
   }
 
@@ -350,12 +381,21 @@ export class SqliteLedgerStore implements LedgerStore {
       conds.push('forwarded_at is null');
     }
     const where = conds.length ? `where ${conds.join(' and ')}` : '';
-    const rows = this.db.prepare(`select * from incoming_payments ${where} order by received_at desc limit ?`).all(...(args as never[]), filter.limit) as Row[];
+    // V06 (RE-AUDIT 2026-09-17): sweep (unforwardedOnly) sắp theo
+    // last_attempt_at asc (chưa thử lần nào trước, rồi tới thử lâu nhất) chứ
+    // không phải received_at desc — tránh N bản ghi mới nhất lỗi dai dẳng
+    // chiếm hết limit mỗi lượt, chặn bản ghi cũ hơn không bao giờ được thử lại.
+    const order = filter.unforwardedOnly ? 'order by last_attempt_at is not null, last_attempt_at asc, received_at asc' : 'order by received_at desc';
+    const rows = this.db.prepare(`select * from incoming_payments ${where} ${order} limit ?`).all(...(args as never[]), filter.limit) as Row[];
     return rows.map((r) => this.rowToIncoming(r));
   }
 
   markIncomingPaymentForwarded(eventId: string, forwardedAt: string): void {
     this.db.prepare('update incoming_payments set forwarded_at = ? where event_id = ?').run(forwardedAt, eventId);
+  }
+
+  recordForwardAttempt(eventId: string, attemptedAt: string): void {
+    this.db.prepare('update incoming_payments set last_attempt_at = ? where event_id = ?').run(attemptedAt, eventId);
   }
 
   close(): void {
@@ -388,6 +428,7 @@ export class SqliteLedgerStore implements LedgerStore {
       applied: Number(r.applied) === 1,
       transaction_id: r.transaction_id == null ? null : String(r.transaction_id),
       forwarded_at: r.forwarded_at == null ? null : String(r.forwarded_at),
+      last_attempt_at: r.last_attempt_at == null ? null : String(r.last_attempt_at),
       ...(r.bank_code ? { bank_code: String(r.bank_code) } : {}),
       ...(r.description ? { description: String(r.description) } : {}),
       ...(r.reference ? { reference: String(r.reference) } : {}),

@@ -38,7 +38,12 @@ export interface HttpBankProviderOptions {
   // Lưu bản ghi webhook "báo có" (ngân hàng đã ghi có, ta chỉ ghi nhận + tra cứu lại)
   incomingStore: Pick<
     LedgerStore,
-    'transaction' | 'getIncomingPayment' | 'insertIncomingPayment' | 'listIncomingPayments' | 'markIncomingPaymentForwarded'
+    | 'transaction'
+    | 'getIncomingPayment'
+    | 'insertIncomingPayment'
+    | 'listIncomingPayments'
+    | 'markIncomingPaymentForwarded'
+    | 'recordForwardAttempt'
   >;
 }
 
@@ -193,6 +198,7 @@ export class HttpBankProvider implements BankProvider {
       transaction_id: p.reference ?? null,
       received_at: new Date().toISOString(),
       forwarded_at: null,
+      last_attempt_at: null,
     };
     return this.opts.incomingStore.transaction(() => {
       const again = this.opts.incomingStore.getIncomingPayment(p.event_id);
@@ -208,6 +214,10 @@ export class HttpBankProvider implements BankProvider {
 
   async markIncomingPaymentForwarded(eventId: string, forwardedAt: string): Promise<void> {
     this.opts.incomingStore.markIncomingPaymentForwarded(eventId, forwardedAt);
+  }
+
+  async recordForwardAttempt(eventId: string, attemptedAt: string): Promise<void> {
+    this.opts.incomingStore.recordForwardAttempt(eventId, attemptedAt);
   }
 
   async healthCheck(): Promise<{ ok: boolean; detail?: string }> {

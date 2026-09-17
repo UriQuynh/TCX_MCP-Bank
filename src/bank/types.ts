@@ -140,6 +140,13 @@ export interface IncomingPaymentRecord extends IncomingPayment {
   // khỏi `applied`/`duplicate`: 1 bản ghi có thể applied=true mà vẫn chưa
   // forward xong nếu downstream đang lỗi/process từng restart giữa chừng.
   forwarded_at: string | null;
+  // Mốc LẦN THỬ FORWARD GẦN NHẤT (thành công hay thất bại đều cập nhật) — V06
+  // (RE-AUDIT 2026-09-17). Dùng để sweep round-robin theo `last_attempt_at asc
+  // nulls first` thay vì `received_at desc`: nếu không có cột này, N bản ghi
+  // mới nhất lỗi forward dai dẳng (vd downstream trả 500 do dữ liệu xấu) sẽ
+  // CHIẾM VĨNH VIỄN "limit" của mỗi lượt sweep, chặn đứng các bản ghi cũ hơn
+  // không bao giờ được thử lại dù chúng có thể forward thành công ngay.
+  last_attempt_at: string | null;
 }
 
 export interface ApplyIncomingResult {
@@ -176,5 +183,9 @@ export interface BankProvider {
   // (F08, RE-AUDIT 2026-09-17) — outbox sweep định kỳ dùng để biết bản ghi
   // nào còn nợ forward sau khi process restart/downstream outage kéo dài.
   markIncomingPaymentForwarded(eventId: string, forwardedAt: string): Promise<void>;
+  // Ghi nhận 1 lần thử forward THẤT BẠI (V06) — không đổi forwarded_at, chỉ
+  // cập nhật last_attempt_at để sweep sau xếp bản ghi này ra sau các bản ghi
+  // chưa từng/lâu chưa được thử.
+  recordForwardAttempt(eventId: string, attemptedAt: string): Promise<void>;
   healthCheck(): Promise<{ ok: boolean; detail?: string }>;
 }

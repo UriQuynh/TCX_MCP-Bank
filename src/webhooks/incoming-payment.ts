@@ -111,12 +111,19 @@ export interface OutboxDeps {
 // assertSafeForwardTarget chặn SSRF) chứ không chỉ trả false — bọc try/catch ở
 // đây để không bao giờ là 1 unhandled rejection khi gọi kiểu "void ...()".
 export async function attemptForwardAndMark(record: IncomingPaymentRecord, deps: OutboxDeps): Promise<void> {
+  const attemptedAt = new Date().toISOString();
   try {
     const ok = await forwardIncomingPayment(record, { ...deps.forward, audit: deps.audit });
     if (ok) {
-      await deps.bank.markIncomingPaymentForwarded(record.event_id, new Date().toISOString());
+      await deps.bank.markIncomingPaymentForwarded(record.event_id, attemptedAt);
+    } else {
+      // V06 (RE-AUDIT 2026-09-17): ghi nhận lần thử thất bại để sweep sau xếp
+      // bản ghi này ra sau, nhường lượt cho bản ghi lâu chưa được thử —
+      // không làm vậy thì N bản ghi lỗi dai dẳng chiếm hết limit mỗi lượt.
+      await deps.bank.recordForwardAttempt(record.event_id, attemptedAt);
     }
   } catch (err) {
+    await deps.bank.recordForwardAttempt(record.event_id, attemptedAt).catch(() => {});
     deps.audit.log({
       transport: 'http',
       keyId: null,

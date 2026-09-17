@@ -44,6 +44,7 @@ const incoming = (
   applied: walletId !== null,
   transaction_id: null,
   forwarded_at: null,
+  last_attempt_at: null,
   ...over,
 });
 
@@ -97,6 +98,25 @@ describe.each<[string, () => LedgerStore]>([
     expect(s.listIncomingPayments({ limit: 10, unforwardedOnly: true }).map((r) => r.event_id)).toEqual(['e2']);
     expect(s.getIncomingPayment('e1')?.forwarded_at).toBe('2026-08-28T12:00:00.000Z');
     expect(s.getIncomingPayment('e2')?.forwarded_at).toBeNull();
+    s.close();
+  });
+
+  // V06 (RE-AUDIT 2026-09-17): sweep round-robin theo last_attempt_at — bản
+  // ghi CHƯA từng thử (null) phải đứng trước bản đã thử; giữa các bản đã thử,
+  // bản thử lâu nhất trước. Không có thứ tự này thì N bản ghi lỗi dai dẳng
+  // (last_attempt_at luôn mới nhất) chiếm hết `limit` mỗi lượt sweep, chặn
+  // đứng bản ghi khác (kể cả bản chưa từng thử) không bao giờ được thử lại.
+  it('recordForwardAttempt + unforwardedOnly sort: chưa thử đứng trước đã thử; giữa các bản đã thử, thử lâu nhất trước', () => {
+    const s = make();
+    s.insertIncomingPayment(incoming('e1', 'w01', '2026-08-28T10:00:00.000Z'));
+    s.insertIncomingPayment(incoming('e2', 'w01', '2026-08-28T11:00:00.000Z'));
+    s.insertIncomingPayment(incoming('e3', 'w01', '2026-08-28T12:00:00.000Z'));
+
+    // e1, e2 đã thử forward thất bại; e3 chưa từng thử. e1 thử SAU e2.
+    s.recordForwardAttempt('e2', '2026-08-28T13:00:00.000Z');
+    s.recordForwardAttempt('e1', '2026-08-28T14:00:00.000Z');
+
+    expect(s.listIncomingPayments({ limit: 10, unforwardedOnly: true }).map((r) => r.event_id)).toEqual(['e3', 'e2', 'e1']);
     s.close();
   });
 

@@ -60,6 +60,7 @@ const record: IncomingPaymentRecord = {
   applied: true,
   transaction_id: 'txn_1',
   forwarded_at: null,
+  last_attempt_at: null,
 };
 
 function fetchSequence(statuses: Array<number | Error>) {
@@ -191,6 +192,10 @@ describe('attemptForwardAndMark / sweepUnforwardedIncomingPayments', () => {
 
     const [after] = await bank.listIncomingPayments({ limit: 10, unforwardedOnly: true });
     expect(after?.event_id).toBe('e2');
+    // V06 (RE-AUDIT 2026-09-17): lần thử thất bại phải ghi last_attempt_at —
+    // đây là tín hiệu duy nhất để sweep sau xếp bản ghi này ra sau bản ghi
+    // khác chưa từng/lâu chưa được thử (tránh starvation).
+    expect(after?.last_attempt_at).not.toBeNull();
   });
 
   it('assertSafeForwardTarget throw (SSRF) -> attemptForwardAndMark KHÔNG throw ra ngoài (không unhandled rejection)', async () => {
