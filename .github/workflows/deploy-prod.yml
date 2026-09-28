@@ -1,0 +1,50 @@
+name: Test + Deploy MCP-Bank to VPS Prod
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch: {}
+
+# Repo PUBLIC: GITHUB_TOKEN chỉ đọc; secret VPS_* không bao giờ lộ cho PR từ
+# fork (GitHub không cấp secret cho workflow chạy từ fork). Job deploy chỉ
+# chạy khi push vào main.
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      # --ignore-scripts: khớp Dockerfile, không chạy postinstall của dependency.
+      - run: npm ci --ignore-scripts
+      - run: npm run typecheck
+      - run: npm test
+
+  deploy:
+    needs: test
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    env:
+      HAS_DEPLOY_KEY: ${{ secrets.VPS_SSH_KEY != '' }}
+    steps:
+      # Chưa cấu hình secret thì bỏ qua thay vì báo đỏ mỗi lần push. Cần 3
+      # secret giống repo TCX_Backend: VPS_HOST, VPS_USER, VPS_SSH_KEY (key CI
+      # bị ép `command=` trên VPS, chỉ chạy được `deploy <target>`).
+      - name: Thiếu secret VPS_* — bỏ qua deploy
+        if: env.HAS_DEPLOY_KEY != 'true'
+        run: |
+          echo "::warning::Chưa có VPS_SSH_KEY/VPS_HOST/VPS_USER — bỏ qua deploy. Deploy tay trên VPS bằng lệnh /opt/tcx/TCX_Infra/deploy/deploy.sh mcp"
+      - name: Trigger deploy on VPS (build trước, chỉ restart khi build OK)
+        if: env.HAS_DEPLOY_KEY == 'true'
+        uses: appleboy/ssh-action@v1.0.3
+        with:
+          host: ${{ secrets.VPS_HOST }}
+          username: ${{ secrets.VPS_USER }}
+          key: ${{ secrets.VPS_SSH_KEY }}
+          command_timeout: 15m
+          script: deploy mcp
